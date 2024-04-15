@@ -10,7 +10,12 @@ import pathlib
 import torch
 
 from esm import Alphabet, FastaBatchedDataset, ProteinBertModel, pretrained, MSATransformer
+import esm
+from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
+from fairscale.nn.wrap import enable_wrap, wrap
 
+url = "tcp://localhost:23456"
+torch.distributed.init_process_group(backend="nccl", init_method=url, world_size=1, rank=0)
 
 def create_parser():
     parser = argparse.ArgumentParser(
@@ -61,15 +66,34 @@ def create_parser():
 
 
 def run(args):
-    model, alphabet = pretrained.load_model_and_alphabet(args.model_location)
-    model.eval()
+    fsdp_params = dict(
+    mixed_precision=True,
+    flatten_parameters=True,
+    state_dict_device=torch.device("cpu"),  # reduce GPU mem usage
+    cpu_offload=True,  # enable cpu offloading
+    )
+    with enable_wrap(wrapper_cls=FSDP, **fsdp_params):
+        model, alphabet = pretrained.load_model_and_alphabet(args.model_location)
+        model.eval()
+
+        # Wrap each layer in FSDP separately
+        for name, child in model.named_children():
+            if name == "layers":
+                for layer_name, layer in child.named_children():
+                    wrapped_layer = wrap(layer)
+                    setattr(child, layer_name, wrapped_layer)
+        model = wrap(model)
+
+    
+
+
     if isinstance(model, MSATransformer):
         raise ValueError(
             "This script currently does not handle models with MSA input (MSA Transformer)."
         )
-    if torch.cuda.is_available() and not args.nogpu:
-        model = model.cuda()
-        print("Transferred model to GPU")
+#    if torch.cuda.is_available() and not args.nogpu:
+#        model = model.cuda()
+#        print("Transferred model to GPU")
 
     dataset = FastaBatchedDataset.from_file(args.fasta_file)
     batches = dataset.get_batch_indices(args.toks_per_batch, extra_toks_per_seq=1)
